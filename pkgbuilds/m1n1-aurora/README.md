@@ -1,6 +1,6 @@
 # m1n1-aurora
 
-m1n1 v1.6.1 from aurora-silicon/m1n1 (06a4601a351ebfd1abb6abba9a44c34e40d94776) with RC, NHI and PCIe adapter alias fallbacks for the USB4 tunables, plus the Omarchy boot logos. Aurora's device trees name those aliases `usb4-N-acio`, `usb4-N-nhi` and `usb4-N-pcie-adapter`; stock m1n1 only looks up the `usb4_N_*` names. Latest Aurora m1n1 main is not qualified.
+m1n1 v1.6.1 from aurora-silicon/m1n1 (06a4601a351ebfd1abb6abba9a44c34e40d94776) with RC, NHI and PCIe adapter alias fallbacks for the USB4 tunables, plus the Omarchy boot logos. It also carries aurora-silicon/m1n1 c6498e6e1a (`aurora-preboot-uuid.patch`): the OS identity iBoot leaves in the ADT (`/chosen/apfs-preboot-uuid`, the booted APFS volume group) is copied into the FDT, where linux-aurora's Secure Enclave driver reads it to answer the enclave's `GET_OS_UUID`; without it Touch ID enrolment cannot be persisted. Aurora's device trees name those aliases `usb4-N-acio`, `usb4-N-nhi` and `usb4-N-pcie-adapter`; stock m1n1 only looks up the `usb4_N_*` names. Latest Aurora m1n1 main is not qualified.
 
 ## Pairing with linux-aurora
 
