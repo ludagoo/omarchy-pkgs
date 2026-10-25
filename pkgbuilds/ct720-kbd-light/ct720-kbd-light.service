@@ -1,0 +1,17 @@
+[Unit]
+Description=Keyboard backlight from the J313 CT720 ambient light sensor
+After=systemd-backlight@leds:kbd_backlight.service
+# Not enabled by the package. Absent CT720 or kbd_backlight skips the unit,
+# so it is not required and does not fail boot.
+ConditionPathExists=/sys/class/leds/kbd_backlight/brightness
+ConditionPathExists=/sys/bus/iio/devices/iio:device0/in_illuminance_input
+ExecCondition=/usr/bin/grep -qx aop-sensors-als /sys/bus/iio/devices/iio:device0/name
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ct720-kbd-light
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

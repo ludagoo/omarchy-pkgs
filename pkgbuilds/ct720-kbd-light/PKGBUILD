@@ -1,0 +1,41 @@
+# Maintainer: Lucas Goossen <lucas.goossen@hey.com>
+# J313 keyboard backlight. The unit is installed and not enabled.
+
+pkgname=ct720-kbd-light
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='Keyboard backlight driven by the J313 CT720 ambient light sensor'
+arch=('aarch64')
+groups=('omarchy-platform-apple-silicon')
+url='https://github.com/omacom/omarchy-pkgs'
+license=('MIT')
+depends=('glibc')
+makedepends=('gcc' 'make')
+options=('!debug')
+source=(
+  'ct720-kbd-light.c'
+  'Makefile'
+  'ct720-kbd-light.service'
+)
+sha256sums=(
+  '272fd042fea89c014b081fbafb0b1db1ebb189c753f108d213dbe8d11e089124'
+  '583548e004bab3d564a6dd9b07bb93856aae7387145fad7520157c11a694bed3'
+  '76c27870da1549a2e722a5b09a6b96195e1e82f13bf373a5412aad4085ccb0b9'
+)
+
+build() {
+  # makepkg's LDFLAGS do not include -lm, which log() needs.
+  make CFLAGS="${CFLAGS} -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror" \
+       LDFLAGS="${LDFLAGS} -lm"
+}
+
+check() {
+  # Must not open the sensor, the LED, or input devices.
+  ./ct720-kbd-light --self-test
+}
+
+package() {
+  install -Dm755 ct720-kbd-light "$pkgdir/usr/bin/ct720-kbd-light"
+  install -Dm644 ct720-kbd-light.service \
+    "$pkgdir/usr/lib/systemd/system/ct720-kbd-light.service"
+}
