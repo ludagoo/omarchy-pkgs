@@ -3,7 +3,7 @@
 
 pkgname=ct720-kbd-light
 pkgver=1.0.0
-pkgrel=2
+pkgrel=3
 pkgdesc='Keyboard backlight driven by the J313 CT720 ambient light sensor'
 arch=('aarch64')
 groups=('omarchy-platform-apple-silicon')
@@ -17,11 +17,9 @@ source=(
   'Makefile'
   'ct720-kbd-light.service'
 )
-sha256sums=(
-  '272fd042fea89c014b081fbafb0b1db1ebb189c753f108d213dbe8d11e089124'
-  '583548e004bab3d564a6dd9b07bb93856aae7387145fad7520157c11a694bed3'
-  '8d1d18ca26a24be74bdf5eccf5c101bc7db487fc85bde7746010f105be078c7a'
-)
+sha256sums=('00494d13019d32da723d99ee588893c6553dece33289226225f06a0c181d3292'
+            '583548e004bab3d564a6dd9b07bb93856aae7387145fad7520157c11a694bed3'
+            '6d1b4f7249d2d03ac998fe8d8dac66dbd8d6cee5345beaa42ab60080fde6089f')
 
 build() {
   # makepkg's LDFLAGS do not include -lm, which log() needs.

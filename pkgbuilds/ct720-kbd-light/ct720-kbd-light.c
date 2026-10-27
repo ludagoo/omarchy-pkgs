@@ -1,8 +1,11 @@
 /*
  * ct720-kbd-light — keyboard backlight for the MacBook Air (M1, 2020), J313.
  *
- * The CT720 ambient-light sensor chooses the level. That level fades out
- * when the panel blanks and when the keyboard and trackpad go idle.
+ * The CT720 ambient-light sensor chooses the level. A brightness the daemon
+ * did not write becomes an offset from that curve and is kept across boots.
+ * Manual off stays off until the user turns the lamp up. The result fades
+ * with the panel and, unless idle hold is "never", after the keyboard and
+ * trackpad go idle.
  *
  * The only backlight write is /sys/class/leds/kbd_backlight/brightness.
  * The PWM controller is left alone.
@@ -43,6 +46,7 @@ static const char PANEL_POWER_PATH[] = "/sys/class/backlight/apple-panel-bl/bl_p
 static const char IIO_NAME_PATH[] = "/sys/bus/iio/devices/iio:device0/name";
 /* Userspace name of the CT720 behind apple,t8103-aop-als. */
 static const char CT720_IIO_NAME[] = "aop-sensors-als";
+static const char OFFSET_PATH[] = "/var/lib/ct720-kbd-light/offset";
 
 static const char KBD_INPUT_NAME[] = "Apple SPI Keyboard";
 static const char PAD_INPUT_NAME[] = "Apple SPI Trackpad";
@@ -58,6 +62,9 @@ static const double DISPLAY_STILL_EPS = 0.008;
 static const double DISPLAY_BLANK_EPS = 0.004;
 static const double DISPLAY_SLEW_DOWN = 0.45;
 static const double DISPLAY_SLEW_UP = 0.35;
+static const double MANUAL_PAUSE_S = 2.0;
+static const double FADE_MANUAL_S = 0.350;
+static const double FADE_AUTO_S = 0.500;
 
 /* Above this lux the keys are readable without the lamp. */
 struct lux_knot {
@@ -82,6 +89,8 @@ enum { MAX_INPUTS = 8 };
 struct config {
 	int verbose;
 	int dry_run;
+	int no_auto;
+	int idle_never;
 	int have_lux_override;
 	double lux_override;
 	double idle_hold;
@@ -395,6 +404,137 @@ static int level_from(double amb, double disp, double idle, int max_brightness)
 	return (int)lround(x);
 }
 
+/*
+ * curve is lux_to_fraction. offset is the user's manual shift from that curve.
+ * Mute forces off. --no-auto holds manual_frac and applies only the idle fade.
+ * Otherwise the level is clamp01(curve + offset) * disp * idle.
+ */
+static double applied_fraction(double curve, double offset, double disp, double idle,
+			       int muted, int no_auto, double manual_frac)
+{
+	if (muted)
+		return 0.0;
+	idle = clamp01(idle);
+	if (no_auto)
+		return clamp01(manual_frac) * idle;
+	return clamp01(curve + offset) * clamp01(disp) * idle;
+}
+
+/* An external write counts only once we have written, and not during our fade. */
+static int manual_change_detected(int observed, int last_written, int fading)
+{
+	if (fading || last_written < 0)
+		return 0;
+	return observed != last_written;
+}
+
+static double offset_from_manual(int level, int max_brightness, double curve)
+{
+	if (max_brightness <= 0)
+		return 0.0;
+	return (double)level / (double)max_brightness - curve;
+}
+
+static double fade_duration(int manual)
+{
+	return manual ? FADE_MANUAL_S : FADE_AUTO_S;
+}
+
+struct level_fade {
+	int active;
+	int from;
+	int to;
+	double elapsed;
+	double duration;
+};
+
+/* Step a linear fade. *fading is 1 while an intermediate level is in use. */
+static int fade_level(struct level_fade *f, int target, int from_level, double dt,
+		      double duration, int *fading)
+{
+	double u;
+
+	if (dt < 0.0)
+		dt = 0.0;
+	if (f->active && f->duration == duration) {
+		f->to = target;
+		f->elapsed += dt;
+		if (f->elapsed >= f->duration) {
+			f->active = 0;
+			*fading = 0;
+			return f->to;
+		}
+		*fading = 1;
+		u = f->elapsed / f->duration;
+		return (int)lround((double)f->from + ((double)f->to - (double)f->from) * u);
+	}
+	if (from_level < 0 || from_level == target || duration <= 0.0) {
+		f->active = 0;
+		*fading = 0;
+		return target;
+	}
+	f->active = 1;
+	f->from = from_level;
+	f->to = target;
+	f->elapsed = 0.0;
+	f->duration = duration;
+	*fading = 1;
+	return from_level;
+}
+
+static int format_state(char *buf, size_t cap, double offset, int muted)
+{
+	int n;
+
+	n = snprintf(buf, cap, "offset %.8f\nmuted %d\n", offset, muted ? 1 : 0);
+	if (n < 0 || (size_t)n >= cap)
+		return -1;
+	return 0;
+}
+
+static int parse_state(const char *text, double *offset, int *muted)
+{
+	const char *p = text;
+	double off = 0.0;
+	int mute = 0;
+	int saw_off = 0;
+	int saw_mute = 0;
+
+	while (*p) {
+		if (strncmp(p, "offset ", 7) == 0) {
+			char *end = NULL;
+
+			errno = 0;
+			off = strtod(p + 7, &end);
+			if (end == p + 7 || errno || off != off)
+				return -1;
+			saw_off = 1;
+			p = end;
+		} else if (strncmp(p, "muted ", 6) == 0) {
+			char *end = NULL;
+			long v;
+
+			errno = 0;
+			v = strtol(p + 6, &end, 10);
+			if (end == p + 6 || errno || (v != 0 && v != 1))
+				return -1;
+			mute = (int)v;
+			saw_mute = 1;
+			p = end;
+		} else if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+			p++;
+			continue;
+		} else {
+			return -1;
+		}
+	}
+	if (!saw_off || !saw_mute)
+		return -1;
+	*offset = off;
+	*muted = mute;
+	return 0;
+}
+
 static int failures;
 
 static void expect_near(const char *name, double got, double want, double tol)
@@ -569,6 +709,63 @@ static void test_level(void)
 	expect_int("level zero max", level_from(1.0, 1.0, 1.0, 0), 0);
 }
 
+static void test_offset_mute_manual(void)
+{
+	const double curve = lux_to_fraction(5.0);
+	double off;
+	char buf[128];
+	double parsed;
+	int muted;
+	struct level_fade fade;
+	int fading = 0;
+	int level;
+
+	expect_near("curve at 5 lux", curve, 0.70, 1e-9);
+	off = offset_from_manual(128, 255, curve);
+	expect_near("offset from half", off, 128.0 / 255.0 - 0.70, 1e-12);
+	expect_near("applied offset lands on the manual fraction",
+		    applied_fraction(curve, off, 1.0, 1.0, 0, 0, 0.0),
+		    128.0 / 255.0, 1e-12);
+	expect_near("applied clamps above full",
+		    applied_fraction(1.0, 0.40, 1.0, 1.0, 0, 0, 0.0), 1.0, 1e-12);
+	expect_near("applied display and idle",
+		    applied_fraction(0.70, 0.0, 0.5, 0.5, 0, 0, 0.0), 0.175, 1e-12);
+
+	expect_near("muted stays off",
+		    applied_fraction(1.0, 0.0, 1.0, 1.0, 1, 0, 0.0), 0.0, 1e-12);
+	expect_near("muted ignores a curve that the old offset would relight",
+		    applied_fraction(1.0, -0.20, 1.0, 1.0, 1, 0, 1.0), 0.0, 1e-12);
+	expect_near("mute offset", offset_from_manual(0, 255, 0.70), -0.70, 1e-12);
+	expect_int("zero level is the mute signal", offset_from_manual(0, 255, 0.70) < 0.0, 1);
+
+	expect_near("no-auto holds the manual level and idle only",
+		    applied_fraction(0.10, 0.90, 0.20, 0.50, 0, 1, 0.80), 0.40, 1e-12);
+
+	expect_int("no detect before the first write", manual_change_detected(10, -1, 0), 0);
+	expect_int("no detect during our fade", manual_change_detected(10, 20, 1), 0);
+	expect_int("no detect when the value is ours", manual_change_detected(20, 20, 0), 0);
+	expect_int("detect an external write", manual_change_detected(0, 20, 0), 1);
+
+	expect_near("manual fade is 350 ms", fade_duration(1), 0.350, 1e-12);
+	expect_near("automatic fade is 500 ms", fade_duration(0), 0.500, 1e-12);
+	memset(&fade, 0, sizeof fade);
+	level = fade_level(&fade, 100, 0, 0.0, FADE_AUTO_S, &fading);
+	expect_int("fade starts at the current level", level, 0);
+	expect_int("fade is in progress", fading, 1);
+	level = fade_level(&fade, 100, 0, 0.250, FADE_AUTO_S, &fading);
+	expect_int("fade midpoint", level, 50);
+	expect_int("fade still in progress", fading, 1);
+	level = fade_level(&fade, 100, 50, 0.250, FADE_AUTO_S, &fading);
+	expect_int("fade ends on the target", level, 100);
+	expect_int("fade finished", fading, 0);
+
+	expect_int("format state", format_state(buf, sizeof buf, -0.25, 1), 0);
+	expect_int("parse state", parse_state(buf, &parsed, &muted), 0);
+	expect_near("parsed offset", parsed, -0.25, 1e-8);
+	expect_int("parsed mute", muted, 1);
+	expect_int("reject a state with no mute", parse_state("offset 0.1\n", &parsed, &muted), -1);
+}
+
 static int self_test(void)
 {
 	test_lux_curve();
@@ -576,6 +773,7 @@ static int self_test(void)
 	test_display_fade();
 	test_idle_fade();
 	test_level();
+	test_offset_mute_manual();
 	if (failures) {
 		fprintf(stderr, "self-test: %d failure%s\n", failures, failures == 1 ? "" : "s");
 		return 1;
@@ -587,14 +785,15 @@ static int self_test(void)
 static void usage(void)
 {
 	fprintf(stderr,
-		"usage: ct720-kbd-light [--dry-run] [--verbose] [--self-test]\n"
-		"                       [--idle-hold SEC] [--idle-fade SEC] [--wake-fade SEC]\n"
+		"usage: ct720-kbd-light [--dry-run] [--verbose] [--self-test] [--no-auto]\n"
+		"                       [--idle-hold SEC|never] [--idle-fade SEC] [--wake-fade SEC]\n"
 		"                       [--lux-override LUX]\n"
 		"\n"
 		"Drive /sys/class/leds/kbd_backlight from the CT720 lux sensor.\n"
-		"The lamp fades out with the panel and after the keyboard and\n"
-		"trackpad have been idle. --dry-run reads sensors and prints the\n"
-		"decision without writing the LED.\n");
+		"A manual brightness change is remembered as an offset from the lux\n"
+		"curve. Manual off stays off until the user raises it. Idle hold\n"
+		"defaults to never, matching macOS. --no-auto keeps that manual level\n"
+		"and applies only the idle fade. --dry-run does not write the LED.\n");
 }
 
 static int parse_double_arg(const char *s, double *out)
@@ -615,6 +814,7 @@ static int parse_args(int argc, char **argv, struct config *cfg, int *self_test_
 	int i;
 
 	memset(cfg, 0, sizeof *cfg);
+	cfg->idle_never = 1;
 	cfg->idle_hold = 10.0;
 	cfg->idle_fade = 1.20;
 	cfg->wake_fade = 0.30;
@@ -636,6 +836,10 @@ static int parse_args(int argc, char **argv, struct config *cfg, int *self_test_
 			cfg->dry_run = 1;
 			continue;
 		}
+		if (strcmp(a, "--no-auto") == 0) {
+			cfg->no_auto = 1;
+			continue;
+		}
 		if (strcmp(a, "--self-test") == 0) {
 			*self_test_flag = 1;
 			continue;
@@ -645,6 +849,11 @@ static int parse_args(int argc, char **argv, struct config *cfg, int *self_test_
 		else if (strcmp(a, "--idle-hold") == 0 && i + 1 < argc)
 			val = argv[++i];
 		if (val && strncmp(a, "--idle-hold", 11) == 0) {
+			if (strcmp(val, "never") == 0) {
+				cfg->idle_never = 1;
+				continue;
+			}
+			cfg->idle_never = 0;
 			if (parse_double_arg(val, &cfg->idle_hold) || cfg->idle_hold < 0.0)
 				goto bad;
 			continue;
@@ -1045,6 +1254,54 @@ static int ct720_sensor_kind(void)
 	return 0;
 }
 
+static int save_state(double offset, int muted)
+{
+	char body[128];
+	char tmp[160];
+	int fd;
+	size_t len;
+	ssize_t n;
+
+	if (format_state(body, sizeof body, offset, muted))
+		return -1;
+	if (snprintf(tmp, sizeof tmp, "%s.tmp", OFFSET_PATH) >= (int)sizeof tmp)
+		return -1;
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (fd < 0)
+		return -1;
+	len = strlen(body);
+	n = write(fd, body, len);
+	if (n < 0 || (size_t)n != len || fsync(fd)) {
+		int err = errno;
+
+		close(fd);
+		unlink(tmp);
+		errno = err;
+		return -1;
+	}
+	if (close(fd)) {
+		unlink(tmp);
+		return -1;
+	}
+	if (rename(tmp, OFFSET_PATH)) {
+		int err = errno;
+
+		unlink(tmp);
+		errno = err;
+		return -1;
+	}
+	return 0;
+}
+
+static int load_state(double *offset, int *muted)
+{
+	char buf[256];
+
+	if (read_path_text(OFFSET_PATH, buf, sizeof buf))
+		return -1;
+	return parse_state(buf, offset, muted);
+}
+
 static int run_daemon(const struct config *cfg)
 {
 	int lux_fd = -1;
@@ -1056,7 +1313,16 @@ static int run_daemon(const struct config *cfg)
 	int timer_fd = -1;
 	int max_brightness = 255;
 	int last_level = -1;
+	int last_written = -1;
+	int fading = 0;
+	int manual_fade = 0;
+	int muted = 0;
+	int manual_seeded = 0;
 	int write_errors = 0;
+	double offset = 0.0;
+	double manual_frac = 1.0;
+	double pause_until = 0.0;
+	struct level_fade fade;
 	int have_panel_actual = 0;
 	int have_panel_max = 0;
 	int have_bl_power = 0;
@@ -1082,6 +1348,7 @@ static int run_daemon(const struct config *cfg)
 	memset(&ema, 0, sizeof ema);
 	memset(&display, 0, sizeof display);
 	memset(&idle, 0, sizeof idle);
+	memset(&fade, 0, sizeof fade);
 	memset(inputs, 0, sizeof inputs);
 	dpms_path[0] = '\0';
 
@@ -1159,11 +1426,28 @@ static int run_daemon(const struct config *cfg)
 		goto out;
 	}
 
-	fprintf(stderr,
-		"ct720-kbd-light: %sCT720 -> kbd_backlight (max %d), idle hold %.1fs fade %.1fs%s\n",
-		cfg->dry_run ? "dry-run " : "",
-		max_brightness, cfg->idle_hold, cfg->idle_fade,
-		cfg->have_lux_override ? ", lux override" : "");
+	if (access(OFFSET_PATH, R_OK) == 0) {
+		if (load_state(&offset, &muted))
+			fprintf(stderr, "ct720-kbd-light: ignoring unreadable %s\n", OFFSET_PATH);
+		else if (muted)
+			manual_frac = 0.0;
+	}
+
+	{
+		char hold_text[32];
+
+		if (cfg->idle_never)
+			snprintf(hold_text, sizeof hold_text, "never");
+		else
+			snprintf(hold_text, sizeof hold_text, "%.1fs", cfg->idle_hold);
+		fprintf(stderr,
+			"ct720-kbd-light: %sCT720 -> kbd_backlight (max %d), idle hold %s fade %.1fs%s%s%s\n",
+			cfg->dry_run ? "dry-run " : "",
+			max_brightness, hold_text, cfg->idle_fade,
+			cfg->have_lux_override ? ", lux override" : "",
+			cfg->no_auto ? ", manual hold" : "",
+			muted ? ", muted" : "");
+	}
 	for (i = 0; i < ninputs; i++)
 		fprintf(stderr, "ct720-kbd-light: input %s%s%s\n", inputs[i].name,
 			inputs[i].activity ? " activity" : "",
@@ -1276,10 +1560,72 @@ static int run_daemon(const struct config *cfg)
 
 		amb = lux_to_fraction(ema.v);
 		display_fade_step(&display, panel_frac, dt);
-		idle_fade_step(&idle, now, activity, dt, cfg->idle_hold, cfg->idle_fade, cfg->wake_fade);
-		level = level_from(amb, display.gain, idle.gain, max_brightness);
+		if (cfg->idle_never) {
+			if (!idle.inited) {
+				idle.inited = 1;
+				idle.gain = 1.0;
+				idle.last_activity = now;
+			}
+			idle.gain = 1.0;
+			if (activity)
+				idle.last_activity = now;
+		} else {
+			idle_fade_step(&idle, now, activity, dt, cfg->idle_hold, cfg->idle_fade, cfg->wake_fade);
+		}
 
-		if (level != last_level) {
+		{
+			int observed = -1;
+
+			if (read_fd_int(kbd_fd, &observed) == 0) {
+				if (!manual_seeded && max_brightness > 0) {
+					if (cfg->no_auto && !muted)
+						manual_frac = (double)observed / (double)max_brightness;
+					manual_seeded = 1;
+				}
+				/* The level already on the LED is not a manual change. */
+				if (last_written < 0) {
+					last_written = observed;
+					last_level = observed;
+				}
+				if (manual_change_detected(observed, last_written, fading)) {
+					offset = offset_from_manual(observed, max_brightness, amb);
+					muted = observed == 0;
+					manual_frac = max_brightness > 0
+						? (double)observed / (double)max_brightness : 0.0;
+					last_written = observed;
+					last_level = observed;
+					pause_until = now + MANUAL_PAUSE_S;
+					manual_fade = 1;
+					fading = 0;
+					fade.active = 0;
+					if (!cfg->dry_run && save_state(offset, muted))
+						fprintf(stderr, "ct720-kbd-light: cannot save offset: %s\n",
+							strerror(errno));
+					fprintf(stderr,
+						"ct720-kbd-light: manual level %d offset %.3f%s\n",
+						observed, offset, muted ? " muted" : "");
+				}
+			}
+		}
+
+		{
+			double frac = applied_fraction(amb, offset, display.gain, idle.gain,
+						       muted, cfg->no_auto, manual_frac);
+			int target = level_from(frac, 1.0, 1.0, max_brightness);
+
+			if (now < pause_until) {
+				level = last_written >= 0 ? last_written : target;
+			} else {
+				int from = last_written >= 0 ? last_written : target;
+				double dur = fade_duration(manual_fade);
+
+				level = fade_level(&fade, target, from, dt, dur, &fading);
+				if (!fading && level == target)
+					manual_fade = 0;
+			}
+		}
+
+		if (now >= pause_until && level != last_level) {
 			if (!cfg->dry_run) {
 				if (write_fd_int(kbd_fd, level)) {
 					write_errors++;
@@ -1291,11 +1637,13 @@ static int run_daemon(const struct config *cfg)
 				}
 				write_errors = 0;
 			}
+			last_written = level;
 			if (cfg->verbose || (level == 0) != (last_level == 0) || last_level < 0) {
 				fprintf(stderr,
-					"ct720-kbd-light:%s level %d (lux %.1f amb %.3f disp %.3f idle %.3f)\n",
+					"ct720-kbd-light:%s level %d (lux %.1f amb %.3f off %.3f disp %.3f idle %.3f%s)\n",
 					cfg->dry_run ? " dry-run" : "",
-					level, ema.v, amb, display.gain, idle.gain);
+					level, ema.v, amb, offset, display.gain, idle.gain,
+					muted ? " muted" : "");
 			}
 			last_level = level;
 		} else if (cfg->verbose && now - last_status >= 2.0) {
@@ -1307,7 +1655,7 @@ static int run_daemon(const struct config *cfg)
 				dpms_fd < 0 ? "n/a" : (dpms_off ? "off" : "on"),
 				have_bl_power ? bl_power : -1,
 				lid_closed ? "closed" : "open",
-				now - idle.last_activity,
+				cfg->idle_never ? 0.0 : now - idle.last_activity,
 				level);
 			last_status = now;
 		}

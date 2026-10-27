@@ -8,6 +8,7 @@ ConditionPathExists=/sys/bus/iio/devices/iio:device0/in_illuminance_input
 
 [Service]
 ExecCondition=/usr/bin/grep -qx aop-sensors-als /sys/bus/iio/devices/iio:device0/name
+StateDirectory=ct720-kbd-light
 Type=simple
 ExecStart=/usr/bin/ct720-kbd-light
 Restart=on-failure
