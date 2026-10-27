@@ -442,6 +442,31 @@ static int note_applied_level(int dry_run, int level, int last_written)
 	return level;
 }
 
+/* A new fade starts from the level the daemon last applied. Dry-run
+ * leaves last_written at the physical brightness, so the simulated ramp
+ * has to start from last_level or it restarts on every tick. */
+static int fade_from_level(int dry_run, int last_level, int last_written,
+			   int target)
+{
+	int from = dry_run ? last_level : last_written;
+
+	return from >= 0 ? from : target;
+}
+
+/* Advance the consecutive lux-failure count, capped at bound. *log is 1
+ * only when the count first becomes 1 and when it first reaches bound. */
+static int lux_error_advance(int errors, int bound, int *log)
+{
+	if (bound > 0 && errors < bound)
+		errors++;
+	else {
+		*log = 0;
+		return errors;
+	}
+	*log = errors == 1 || errors == bound;
+	return errors;
+}
+
 /* A failed lux read keeps the last good sample so panel, lid, and idle
  * still run. Before smoothed lux may drive the lamp, wait. After
  * LUX_FAIL_BOUND failures the held sample is the fallback and stays held
@@ -774,6 +799,32 @@ static void test_offset_mute_manual(void)
 	expect_int("detect an external write", manual_change_detected(0, 20), 1);
 	expect_int("dry-run keeps the last real write", note_applied_level(1, 40, 10), 10);
 	expect_int("a real write becomes the last write", note_applied_level(0, 40, 10), 40);
+	expect_int("dry-run fade continues from the simulated level",
+		   fade_from_level(1, 80, 10, 100), 80);
+	expect_int("dry-run fade stays once it reaches the target",
+		   fade_from_level(1, 100, 10, 100), 100);
+	expect_int("live fade starts from the last write",
+		   fade_from_level(0, 80, 10, 100), 10);
+	expect_int("fade with no level yet starts at the target",
+		   fade_from_level(1, -1, -1, 40), 40);
+	{
+		int log = 1;
+		int n = 0;
+		int logs = 0;
+		int i;
+
+		for (i = 0; i < LUX_FAIL_BOUND + 5; i++) {
+			n = lux_error_advance(n, LUX_FAIL_BOUND, &log);
+			if (log)
+				logs++;
+		}
+		expect_int("lux warnings are the first failure and the bound", logs, 2);
+		expect_int("lux error count stops at the bound", n, LUX_FAIL_BOUND);
+		n = lux_error_advance(n, LUX_FAIL_BOUND, &log);
+		expect_int("a later lux failure stays quiet", log, 0);
+		expect_int("the bounded fallback still applies",
+			   lux_failure_action(1, n, LUX_FAIL_BOUND), LUX_FALLBACK);
+	}
 	{
 		int last = note_applied_level(1, 40, 10);
 
@@ -1635,13 +1686,13 @@ static int run_daemon(const struct config *cfg)
 				lux_driving = 1;
 		} else {
 			int action;
+			int log_lux = 0;
 
-			if (lux_errors < LUX_FAIL_BOUND)
-				lux_errors++;
+			lux_errors = lux_error_advance(lux_errors, LUX_FAIL_BOUND, &log_lux);
 			action = lux_failure_action(lux_driving, lux_errors, LUX_FAIL_BOUND);
-			if (lux_errors == 1)
+			if (log_lux && lux_errors == 1)
 				fprintf(stderr, "ct720-kbd-light: lux read failed: %s\n", strerror(errno));
-			else if (lux_errors == LUX_FAIL_BOUND)
+			else if (log_lux && lux_errors == LUX_FAIL_BOUND)
 				fprintf(stderr,
 					"ct720-kbd-light: lux read failed %d times; holding the last lux while panel, lid, and idle still apply\n",
 					lux_errors);
@@ -1738,7 +1789,8 @@ static int run_daemon(const struct config *cfg)
 			if (now < pause_until) {
 				level = last_written >= 0 ? last_written : target;
 			} else {
-				int from = last_written >= 0 ? last_written : target;
+				int from = fade_from_level(cfg->dry_run, last_level,
+							    last_written, target);
 				double dur = fade_duration(manual_fade);
 
 				level = fade_level(&fade, target, from, dt, dur, &fading);
