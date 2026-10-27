@@ -3,7 +3,7 @@
 
 pkgname=ct720-kbd-light
 pkgver=1.0.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Keyboard backlight driven by the J313 CT720 ambient light sensor'
 arch=('aarch64')
 groups=('omarchy-platform-apple-silicon')
@@ -20,7 +20,7 @@ source=(
 sha256sums=(
   '272fd042fea89c014b081fbafb0b1db1ebb189c753f108d213dbe8d11e089124'
   '583548e004bab3d564a6dd9b07bb93856aae7387145fad7520157c11a694bed3'
-  '76c27870da1549a2e722a5b09a6b96195e1e82f13bf373a5412aad4085ccb0b9'
+  '8d1d18ca26a24be74bdf5eccf5c101bc7db487fc85bde7746010f105be078c7a'
 )
 
 build() {

@@ -5,9 +5,9 @@ After=systemd-backlight@leds:kbd_backlight.service
 # so it is not required and does not fail boot.
 ConditionPathExists=/sys/class/leds/kbd_backlight/brightness
 ConditionPathExists=/sys/bus/iio/devices/iio:device0/in_illuminance_input
-ExecCondition=/usr/bin/grep -qx aop-sensors-als /sys/bus/iio/devices/iio:device0/name
 
 [Service]
+ExecCondition=/usr/bin/grep -qx aop-sensors-als /sys/bus/iio/devices/iio:device0/name
 Type=simple
 ExecStart=/usr/bin/ct720-kbd-light
 Restart=on-failure
