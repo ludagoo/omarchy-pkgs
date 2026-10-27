@@ -3,7 +3,7 @@
 
 pkgname=ct720-kbd-light
 pkgver=1.0.0
-pkgrel=3
+pkgrel=4
 pkgdesc='Keyboard backlight driven by the J313 CT720 ambient light sensor'
 arch=('aarch64')
 groups=('omarchy-platform-apple-silicon')
@@ -16,10 +16,12 @@ source=(
   'ct720-kbd-light.c'
   'Makefile'
   'ct720-kbd-light.service'
+  'LICENSE'
 )
-sha256sums=('00494d13019d32da723d99ee588893c6553dece33289226225f06a0c181d3292'
+sha256sums=('f41bea06c932d36ea63b6ca6c2515997ef43defc2de0890d7e5a27fbbab7c48a'
             '583548e004bab3d564a6dd9b07bb93856aae7387145fad7520157c11a694bed3'
-            '6d1b4f7249d2d03ac998fe8d8dac66dbd8d6cee5345beaa42ab60080fde6089f')
+            '5213ab4209d81dae54f7319e07df8ec20001740382f3348db4c66e07ccef4d2d'
+            'f3f6f0f34f9154a439bef11a3c885df8d9e4328c7450ad7e18c6f76984c30348')
 
 build() {
   # makepkg's LDFLAGS do not include -lm, which log() needs.
@@ -36,4 +38,5 @@ package() {
   install -Dm755 ct720-kbd-light "$pkgdir/usr/bin/ct720-kbd-light"
   install -Dm644 ct720-kbd-light.service \
     "$pkgdir/usr/lib/systemd/system/ct720-kbd-light.service"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/ct720-kbd-light/LICENSE"
 }

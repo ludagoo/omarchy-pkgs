@@ -36,16 +36,18 @@
 
 #include <linux/input.h>
 
-static const char LUX_PATH[] = "/sys/bus/iio/devices/iio:device0/in_illuminance_input";
+static const char IIO_DEVICES[] = "/sys/bus/iio/devices";
 static const char KBD_BRIGHT_PATH[] = "/sys/class/leds/kbd_backlight/brightness";
 static const char KBD_MAX_PATH[] = "/sys/class/leds/kbd_backlight/max_brightness";
 static const char KBD_TRIGGER_PATH[] = "/sys/class/leds/kbd_backlight/trigger";
 static const char PANEL_ACTUAL_PATH[] = "/sys/class/backlight/apple-panel-bl/actual_brightness";
 static const char PANEL_MAX_PATH[] = "/sys/class/backlight/apple-panel-bl/max_brightness";
 static const char PANEL_POWER_PATH[] = "/sys/class/backlight/apple-panel-bl/bl_power";
-static const char IIO_NAME_PATH[] = "/sys/bus/iio/devices/iio:device0/name";
 /* Userspace name of the CT720 behind apple,t8103-aop-als. */
 static const char CT720_IIO_NAME[] = "aop-sensors-als";
+/* Consecutive lux failures before the held sample is the bounded fallback. */
+enum { LUX_FAIL_BOUND = 20 };
+enum { LUX_WAIT = 0, LUX_HOLD = 1, LUX_FALLBACK = 2 };
 static const char OFFSET_PATH[] = "/var/lib/ct720-kbd-light/offset";
 
 static const char KBD_INPUT_NAME[] = "Apple SPI Keyboard";
@@ -420,12 +422,37 @@ static double applied_fraction(double curve, double offset, double disp, double 
 	return clamp01(curve + offset) * clamp01(disp) * idle;
 }
 
-/* An external write counts only once we have written, and not during our fade. */
-static int manual_change_detected(int observed, int last_written, int fading)
+/* An external write counts once we have written, including during a fade.
+ * The LED sysfs node stores the integer we wrote, so readback matches it
+ * with no rounding window. */
+static int manual_change_detected(int observed, int last_written)
 {
-	if (fading || last_written < 0)
+	if (last_written < 0)
 		return 0;
 	return observed != last_written;
+}
+
+/* Dry-run does not write the LED. A simulated level must not become the
+ * value the next readback is compared with, or the unchanged lamp looks
+ * like a manual change. */
+static int note_applied_level(int dry_run, int level, int last_written)
+{
+	if (dry_run)
+		return last_written;
+	return level;
+}
+
+/* A failed lux read keeps the last good sample so panel, lid, and idle
+ * still run. Before smoothed lux may drive the lamp, wait. After
+ * LUX_FAIL_BOUND failures the held sample is the fallback and stays held
+ * until a read succeeds. */
+static int lux_failure_action(int driving, int consecutive_errors, int bound)
+{
+	if (!driving)
+		return LUX_WAIT;
+	if (bound > 0 && consecutive_errors >= bound)
+		return LUX_FALLBACK;
+	return LUX_HOLD;
 }
 
 static double offset_from_manual(int level, int max_brightness, double curve)
@@ -741,10 +768,25 @@ static void test_offset_mute_manual(void)
 	expect_near("no-auto holds the manual level and idle only",
 		    applied_fraction(0.10, 0.90, 0.20, 0.50, 0, 1, 0.80), 0.40, 1e-12);
 
-	expect_int("no detect before the first write", manual_change_detected(10, -1, 0), 0);
-	expect_int("no detect during our fade", manual_change_detected(10, 20, 1), 0);
-	expect_int("no detect when the value is ours", manual_change_detected(20, 20, 0), 0);
-	expect_int("detect an external write", manual_change_detected(0, 20, 0), 1);
+	expect_int("no detect before the first write", manual_change_detected(10, -1), 0);
+	expect_int("detect a manual change during a fade", manual_change_detected(10, 20), 1);
+	expect_int("no detect when the fade readback is ours", manual_change_detected(20, 20), 0);
+	expect_int("detect an external write", manual_change_detected(0, 20), 1);
+	expect_int("dry-run keeps the last real write", note_applied_level(1, 40, 10), 10);
+	expect_int("a real write becomes the last write", note_applied_level(0, 40, 10), 40);
+	{
+		int last = note_applied_level(1, 40, 10);
+
+		expect_int("dry-run does not invent a manual change",
+			   manual_change_detected(10, last), 0);
+		last = note_applied_level(0, 40, last);
+		expect_int("readback of a real write is not manual",
+			   manual_change_detected(40, last), 0);
+	}
+	expect_int("lux failure before the lamp follows waits", lux_failure_action(0, 1, LUX_FAIL_BOUND), LUX_WAIT);
+	expect_int("lux failure holds the last sample", lux_failure_action(1, 1, LUX_FAIL_BOUND), LUX_HOLD);
+	expect_int("repeated lux failure uses the bounded fallback",
+		   lux_failure_action(1, LUX_FAIL_BOUND, LUX_FAIL_BOUND), LUX_FALLBACK);
 
 	expect_near("manual fade is 350 ms", fade_duration(1), 0.350, 1e-12);
 	expect_near("automatic fade is 500 ms", fade_duration(0), 0.500, 1e-12);
@@ -1239,19 +1281,61 @@ static void close_inputs(struct input_src *srcs, int n)
 	}
 }
 
-/* 1 = CT720, 0 = a different sensor, -1 = name node not readable. */
-static int ct720_sensor_kind(void)
+/* 1 = wrote the CT720 illuminance path, 0 = other iio devices only,
+ * -1 = no iio device could be named. Does not open the illuminance node. */
+static int find_ct720_lux_path(char *path, size_t cap)
 {
-	char name[128];
+	DIR *dir;
+	struct dirent *ent;
+	int other = 0;
 
-	if (read_path_text(IIO_NAME_PATH, name, sizeof name))
+	dir = opendir(IIO_DEVICES);
+	if (!dir)
 		return -1;
-	name[strcspn(name, "\n")] = '\0';
-	if (strcmp(name, CT720_IIO_NAME) == 0)
+	while ((ent = readdir(dir)) != NULL) {
+		char name_path[512];
+		char name[128];
+
+		if (strncmp(ent->d_name, "iio:device", 10) != 0)
+			continue;
+		if (snprintf(name_path, sizeof name_path, "%s/%s/name",
+			     IIO_DEVICES, ent->d_name) >= (int)sizeof name_path)
+			continue;
+		if (read_path_text(name_path, name, sizeof name))
+			continue;
+		name[strcspn(name, "\n")] = '\0';
+		if (strcmp(name, CT720_IIO_NAME) != 0) {
+			other = 1;
+			continue;
+		}
+		if (snprintf(path, cap, "%s/%s/in_illuminance_input",
+			     IIO_DEVICES, ent->d_name) >= (int)cap) {
+			closedir(dir);
+			return -1;
+		}
+		closedir(dir);
 		return 1;
-	fprintf(stderr, "ct720-kbd-light: %s is \"%s\", not the CT720; nothing to do\n",
-		IIO_NAME_PATH, name);
-	return 0;
+	}
+	closedir(dir);
+	return other ? 0 : -1;
+}
+
+/* Retries while no iio device is named yet. A definite non-CT720 scan
+ * returns immediately so the wrong machine is not polled for the whole wait. */
+static int wait_ct720_lux_path(char *path, size_t cap, int seconds)
+{
+	int i;
+	int kind = -1;
+
+	for (i = 0; i < seconds * 2; i++) {
+		kind = find_ct720_lux_path(path, cap);
+		if (kind == 1 || kind == 0)
+			return kind;
+		if (g_stop)
+			return -1;
+		nanosleep(&(struct timespec){ .tv_nsec = 500000000L }, NULL);
+	}
+	return kind;
 }
 
 static int save_state(double offset, int muted)
@@ -1319,6 +1403,9 @@ static int run_daemon(const struct config *cfg)
 	int muted = 0;
 	int manual_seeded = 0;
 	int write_errors = 0;
+	int lux_errors = 0;
+	int lux_driving = 0;
+	char lux_path[512];
 	double offset = 0.0;
 	double manual_frac = 1.0;
 	double pause_until = 0.0;
@@ -1351,32 +1438,49 @@ static int run_daemon(const struct config *cfg)
 	memset(&fade, 0, sizeof fade);
 	memset(inputs, 0, sizeof inputs);
 	dpms_path[0] = '\0';
+	lux_path[0] = '\0';
 
-	/* Not this machine: leave whatever backlight it has alone. */
+	/* Not this machine: leave whatever backlight it has alone. The CT720
+	 * is whichever iio device is named aop-sensors-als, not device0. */
 	if (!cfg->have_lux_override) {
-		int lux_there = access(LUX_PATH, F_OK) == 0;
+		int kind = find_ct720_lux_path(lux_path, sizeof lux_path);
 		int kbd_there = access(KBD_BRIGHT_PATH, F_OK) == 0;
 
-		if (!lux_there && !kbd_there) {
+		if (kind == 0) {
+			fprintf(stderr,
+				"ct720-kbd-light: iio devices are present but none is %s; nothing to do\n",
+				CT720_IIO_NAME);
+			return 0;
+		}
+		if (kind != 1 && !kbd_there) {
 			fprintf(stderr,
 				"ct720-kbd-light: no CT720 lux sensor or kbd_backlight; nothing to do\n");
 			return 0;
 		}
-		if (lux_there && ct720_sensor_kind() == 0)
+		if (kind != 1)
+			kind = wait_ct720_lux_path(lux_path, sizeof lux_path, 20);
+		if (kind == 0) {
+			fprintf(stderr,
+				"ct720-kbd-light: iio devices are present but none is %s; nothing to do\n",
+				CT720_IIO_NAME);
 			return 0;
-	}
-
-	lux_fd = open_retry(LUX_PATH, O_RDONLY, cfg->have_lux_override ? 1 : 20);
-	if (lux_fd < 0 && !cfg->have_lux_override) {
-		int err = errno;
-
-		if (err == ENOENT) {
+		}
+		if (kind != 1) {
 			fprintf(stderr, "ct720-kbd-light: no CT720 lux sensor; nothing to do\n");
-			rc = 0;
+			return 0;
+		}
+		lux_fd = open_retry(lux_path, O_RDONLY, 20);
+		if (lux_fd < 0) {
+			int err = errno;
+
+			if (err == ENOENT) {
+				fprintf(stderr, "ct720-kbd-light: no CT720 lux sensor; nothing to do\n");
+				rc = 0;
+				goto out;
+			}
+			fprintf(stderr, "ct720-kbd-light: cannot open %s: %s\n", lux_path, strerror(err));
 			goto out;
 		}
-		fprintf(stderr, "ct720-kbd-light: cannot open %s: %s\n", LUX_PATH, strerror(err));
-		goto out;
 	}
 	kbd_fd = open_retry(KBD_BRIGHT_PATH, cfg->dry_run ? O_RDONLY : O_RDWR, 20);
 	if (kbd_fd < 0) {
@@ -1521,13 +1625,31 @@ static int run_daemon(const struct config *cfg)
 		if (cfg->have_lux_override) {
 			sample = cfg->lux_override;
 			ready = lux_ema_step(&ema, sample, dt, 0.0, 0.0);
+			lux_errors = 0;
+			if (ready)
+				lux_driving = 1;
+		} else if (read_fd_double(lux_fd, &sample) == 0) {
+			lux_errors = 0;
+			ready = lux_ema_step(&ema, sample, dt, LUX_EMA_TAU, LUX_BRIGHT_WINDOW);
+			if (ready)
+				lux_driving = 1;
 		} else {
-			if (read_fd_double(lux_fd, &sample)) {
+			int action;
+
+			if (lux_errors < LUX_FAIL_BOUND)
+				lux_errors++;
+			action = lux_failure_action(lux_driving, lux_errors, LUX_FAIL_BOUND);
+			if (lux_errors == 1)
 				fprintf(stderr, "ct720-kbd-light: lux read failed: %s\n", strerror(errno));
+			else if (lux_errors == LUX_FAIL_BOUND)
+				fprintf(stderr,
+					"ct720-kbd-light: lux read failed %d times; holding the last lux while panel, lid, and idle still apply\n",
+					lux_errors);
+			if (action == LUX_WAIT) {
 				pending_activity = activity;
 				continue;
 			}
-			ready = lux_ema_step(&ema, sample, dt, LUX_EMA_TAU, LUX_BRIGHT_WINDOW);
+			ready = 1;
 		}
 		if (!ready) {
 			pending_activity = activity;
@@ -1587,7 +1709,7 @@ static int run_daemon(const struct config *cfg)
 					last_written = observed;
 					last_level = observed;
 				}
-				if (manual_change_detected(observed, last_written, fading)) {
+				if (!cfg->dry_run && manual_change_detected(observed, last_written)) {
 					offset = offset_from_manual(observed, max_brightness, amb);
 					muted = observed == 0;
 					manual_frac = max_brightness > 0
@@ -1637,7 +1759,7 @@ static int run_daemon(const struct config *cfg)
 				}
 				write_errors = 0;
 			}
-			last_written = level;
+			last_written = note_applied_level(cfg->dry_run, level, last_written);
 			if (cfg->verbose || (level == 0) != (last_level == 0) || last_level < 0) {
 				fprintf(stderr,
 					"ct720-kbd-light:%s level %d (lux %.1f amb %.3f off %.3f disp %.3f idle %.3f%s)\n",
